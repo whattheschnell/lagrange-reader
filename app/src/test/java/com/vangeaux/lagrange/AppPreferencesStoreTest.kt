@@ -375,4 +375,11 @@ class AppPreferencesStoreTest {
         )
         assertEquals(null, backgroundRefreshNetworkType(BackgroundRefreshNetworkPolicy.DISABLED))
     }
+    @Test
+    fun androidAutoTimelineByChapterDefaultsToDisabledAndRoundTrips() {
+        assertEquals(false, AppPreferences().androidAutoTimelineByChapter)
+        assertEquals(false, androidAutoTimelineByChapterFromStorage(false))
+        assertEquals(true, androidAutoTimelineByChapterFromStorage(true))
+        assertEquals(false, androidAutoTimelineByChapterFromStorage(null))
+    }
 }

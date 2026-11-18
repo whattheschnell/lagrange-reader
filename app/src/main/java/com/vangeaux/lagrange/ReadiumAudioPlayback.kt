@@ -1300,7 +1300,10 @@ class ReadiumAudioPlaybackService : MediaLibraryService() {
                 AppPreferencesStore(applicationContext).read().scaleProgressByPlaybackSpeed
             },
             isAutoConnectedProvider = ::hasConnectedAndroidAutoController,
-            contextProvider = ::getApplicationContext
+            contextProvider = ::getApplicationContext,
+            timelineByChapterProvider = {
+                AppPreferencesStore(applicationContext).read().androidAutoTimelineByChapter
+            }
         ).also {
             librarySessionPlayer = it
         }
@@ -1356,7 +1359,10 @@ class ReadiumAudioPlaybackService : MediaLibraryService() {
                         AppPreferencesStore(applicationContext).read().scaleProgressByPlaybackSpeed
                     },
                     isAutoConnectedProvider = ::hasConnectedAndroidAutoController,
-                    contextProvider = ::getApplicationContext
+                    contextProvider = ::getApplicationContext,
+                    timelineByChapterProvider = {
+                        AppPreferencesStore(applicationContext).read().androidAutoTimelineByChapter
+                    }
                 )
                 wrappedPlayer.addListener(object : Player.Listener {
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
