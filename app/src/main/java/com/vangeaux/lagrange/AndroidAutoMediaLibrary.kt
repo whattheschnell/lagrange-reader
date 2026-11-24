@@ -1960,8 +1960,15 @@ internal class LagrangeLibrarySessionPlayer(
     private val sessionProvider: (() -> ReadiumAudioPlaybackService.Session?)? = null,
     private val scaleBySpeedProvider: (() -> Boolean)? = null,
     private val isAutoConnectedProvider: (() -> Boolean)? = null,
-    private val contextProvider: (() -> Context?)? = null
+    private val contextProvider: (() -> Context?)? = null,
+    private val timelineByChapterProvider: (() -> Boolean)? = null
 ) : ForwardingPlayer(delegate) {
+    internal fun isTimelineByChapterEnabled(): Boolean {
+        val pref = timelineByChapterProvider?.invoke() == true
+        val active = sessionProvider?.invoke()
+        val isMultiFile = active != null && active.audioFiles.size > 1
+        return pref || isMultiFile
+    }
     @Volatile
     private var suppressNextSetMediaItems = false
     @Volatile
@@ -2283,55 +2290,240 @@ internal class LagrangeLibrarySessionPlayer(
 
     override fun isCurrentMediaItemDynamic(): Boolean = false
 
+    override fun getMediaMetadata(): androidx.media3.common.MediaMetadata {
+        val base = super.getMediaMetadata()
+        val fallback = fallbackMetadataProvider?.invoke()
+        val active = sessionProvider?.invoke()
+        val builder = base.buildUpon()
+
+        val rawTitle = if (!base.title.isNullOrBlank()) {
+            base.title.toString()
+        } else {
+            fallback?.title?.toString()
+        }
+        if (!rawTitle.isNullOrBlank()) {
+            builder.setTitle(rawTitle.sanitizeAudiobookTitle())
+        }
+        if (base.artworkUri == null && fallback?.artworkUri != null) {
+            builder.setArtworkUri(fallback.artworkUri)
+        }
+        if (base.artworkData == null && fallback?.artworkData != null) {
+            builder.setArtworkData(fallback.artworkData, fallback.artworkDataType)
+        }
+        val currentDuration = duration
+        if (currentDuration != androidx.media3.common.C.TIME_UNSET && currentDuration > 0L) {
+            builder.setDurationMs(currentDuration)
+        }
+
+        val book = active?.book
+        if (book == null) {
+            val rawAuthor = base.artist?.toString()?.takeIf { it.isNotBlank() }
+                ?: fallback?.artist?.toString()?.takeIf { it.isNotBlank() }
+            val effectiveArtist = resolveSubtitleOrArtist(rawAuthor)
+            if (!effectiveArtist.isNullOrBlank()) {
+                builder.setArtist(effectiveArtist)
+                if (shouldFormatAndroidAutoEtaSubtitle()) {
+                    builder.setSubtitle(effectiveArtist)
+                }
+            }
+            return builder.build()
+        }
+
+        val chapters = book.audioChapters
+        val bookTitle = runCatching { book.javaClass.getMethod("getTitle").invoke(book) as? String }.getOrNull() ?: ""
+        
+        val rawAuthor = base.artist?.toString()?.takeIf { it.isNotBlank() }
+            ?: fallback?.artist?.toString()?.takeIf { it.isNotBlank() }
+        val effectiveArtist = resolveSubtitleOrArtist(rawAuthor)
+        val originalSub = if (shouldFormatAndroidAutoEtaSubtitle() && !effectiveArtist.isNullOrBlank()) {
+            effectiveArtist
+        } else {
+            base.subtitle?.toString() ?: ""
+        }
+
+        if (isTimelineByChapterEnabled()) {
+            val currentIdx = currentMediaItemIndex
+            val chapTitle = if (!chapters.isNullOrEmpty() && currentIdx in chapters.indices) {
+                chapters[currentIdx].title ?: "Chapter ${currentIdx + 1}"
+            } else {
+                "Part ${currentIdx + 1}"
+            }
+            builder.setTitle(chapTitle)
+            if (bookTitle.isNotBlank()) {
+                val newSub = if (originalSub.isNotBlank()) "$bookTitle  •  $originalSub" else bookTitle
+                builder.setSubtitle(newSub).setArtist(bookTitle).setAlbumTitle(bookTitle)
+            }
+        } else {
+            if (bookTitle.isNotBlank()) {
+                builder.setTitle(bookTitle).setAlbumTitle(bookTitle)
+            }
+            if (!chapters.isNullOrEmpty()) {
+                val absPos = active.absolutePositionMs().coerceAtLeast(0L)
+                val currentIdx = chapters.indexOfLast { it.startMs <= absPos + 1_000L }
+                if (currentIdx >= 0) {
+                    val chapTitle = chapters[currentIdx].title ?: "Chapter ${currentIdx + 1}"
+                    val newSub = if (originalSub.isNotBlank()) "$chapTitle  •  $originalSub" else chapTitle
+                    builder.setSubtitle(newSub).setArtist(chapTitle)
+                }
+            } else if (originalSub.isNotBlank()) {
+                builder.setSubtitle(originalSub)
+            }
+        }
+        return builder.build()
+    }
+
+    override fun getCurrentMediaItemIndex(): Int {
+        val active = sessionProvider?.invoke()
+        val chapters = active?.book?.audioChapters
+        if (!chapters.isNullOrEmpty()) {
+            val absPos = active.absolutePositionMs().coerceAtLeast(0L)
+            val currentIdx = chapters.indexOfLast { it.startMs <= absPos + 1_000L }
+            return if (currentIdx >= 0) currentIdx else 0
+        }
+        return super.getCurrentMediaItemIndex()
+    }
+
+    override fun getMediaItemCount(): Int {
+        val active = sessionProvider?.invoke()
+        val chapters = active?.book?.audioChapters
+        if (!chapters.isNullOrEmpty()) {
+            return chapters.size
+        }
+        return super.getMediaItemCount()
+    }
+
     override fun getDuration(): Long {
-        val bounds = rawActiveBookOrTrackBounds()
-        val rawDuration = bounds?.second
-            ?: super.getDuration().takeIf { it != C.TIME_UNSET && it > 0L }
-            ?: sessionProvider?.invoke()?.totalDurationMs()?.takeIf { it > 0L }
-            ?: return super.getDuration()
-        return scaleAudioTimeMs(rawDuration, actualSpeed(), isScaled())
+        val active = sessionProvider?.invoke()
+        val chapters = active?.book?.audioChapters
+        if (!chapters.isNullOrEmpty()) {
+            if (isTimelineByChapterEnabled()) {
+                val idx = currentMediaItemIndex
+                if (idx in chapters.indices) {
+                    val chap = chapters[idx]
+                    val nextStart = if (idx + 1 < chapters.size) chapters[idx + 1].startMs else active.totalDurationMs()
+                    val dur = (nextStart - chap.startMs).coerceAtLeast(0L)
+                    return if (isScaled()) scaleAudioTimeMs(dur, actualSpeed(), true) else dur
+                }
+            } else {
+                val totalMs = active.totalDurationMs()
+                return if (isScaled()) scaleAudioTimeMs(totalMs, actualSpeed(), true) else totalMs
+            }
+        }
+        val raw = super.getDuration()
+        if (raw == androidx.media3.common.C.TIME_UNSET || raw < 0L) return raw
+        return if (isScaled()) scaleAudioTimeMs(raw, actualSpeed(), true) else raw
     }
 
     override fun getCurrentPosition(): Long {
-        val bounds = rawActiveBookOrTrackBounds()
-        val rawPosition = bounds?.first
-            ?: super.getCurrentPosition().coerceAtLeast(0L)
-        return scaleAudioTimeMs(rawPosition, actualSpeed(), isScaled())
-    }
-
-    override fun getContentPosition(): Long = currentPosition
-
-    override fun getContentDuration(): Long = duration
-
-    override fun getBufferedPosition(): Long {
-        val dur = duration
-        val pos = currentPosition
-        val rawBuf = scaleAudioTimeMs(super.getBufferedPosition().coerceAtLeast(0L), actualSpeed(), isScaled())
-        return if (dur != C.TIME_UNSET && dur > 0L) {
-            rawBuf.coerceIn(pos, dur)
-        } else {
-            rawBuf.coerceAtLeast(pos)
+        val active = sessionProvider?.invoke()
+        val chapters = active?.book?.audioChapters
+        if (!chapters.isNullOrEmpty()) {
+            val absPos = active.absolutePositionMs().coerceAtLeast(0L)
+            if (isTimelineByChapterEnabled()) {
+                val idx = currentMediaItemIndex
+                if (idx in chapters.indices) {
+                    val chapPos = (absPos - chapters[idx].startMs).coerceAtLeast(0L)
+                    return if (isScaled()) scaleAudioTimeMs(chapPos, actualSpeed(), true) else chapPos
+                }
+            } else {
+                return if (isScaled()) scaleAudioTimeMs(absPos, actualSpeed(), true) else absPos
+            }
         }
-    }
-
-    override fun getCurrentMediaItem(): MediaItem? {
-        val base = super.getCurrentMediaItem() ?: return null
-        val currentDuration = duration
-        if (currentDuration != C.TIME_UNSET && currentDuration > 0L) {
-            val updatedMeta = base.mediaMetadata.buildUpon()
-                .setDurationMs(currentDuration)
-                .build()
-            return base.buildUpon().setMediaMetadata(updatedMeta).build()
-        }
-        return base
+        val raw = super.getCurrentPosition().coerceAtLeast(0L)
+        return if (isScaled()) scaleAudioTimeMs(raw, actualSpeed(), true) else raw
     }
 
     override fun getCurrentTimeline(): Timeline {
+        val active = sessionProvider?.invoke()
+        val chapters = active?.book?.audioChapters
+        if (!chapters.isNullOrEmpty()) {
+            val byChapter = isTimelineByChapterEnabled()
+            val totalMs = active.totalDurationMs()
+            val speed = actualSpeed()
+            val scaled = isScaled()
+            
+            return object : Timeline() {
+                override fun getWindowCount(): Int = chapters.size
+
+                override fun getWindow(
+                    windowIndex: Int,
+                    window: Window,
+                    defaultPositionProjectionUs: Long
+                ): Window {
+                    val chapter = chapters[windowIndex]
+                    val nextStart = if (windowIndex + 1 < chapters.size) chapters[windowIndex + 1].startMs else totalMs
+                    val durMs = if (byChapter) (nextStart - chapter.startMs).coerceAtLeast(0L) else totalMs
+                    val effectiveDurMs = if (scaled) scaleAudioTimeMs(durMs, speed, true) else durMs
+                    val chapId = "chap_$windowIndex"
+                    
+                    window.set(
+                        chapId,
+                        androidx.media3.common.MediaItem.Builder()
+                            .setMediaId(chapId)
+                            .setMediaMetadata(androidx.media3.common.MediaMetadata.Builder()
+                                .setTitle(chapter.title ?: "Chapter ${windowIndex + 1}")
+                                .build())
+                            .build(),
+                        null,
+                        androidx.media3.common.C.TIME_UNSET,
+                        androidx.media3.common.C.TIME_UNSET,
+                        androidx.media3.common.C.TIME_UNSET,
+                        true,
+                        false,
+                        null,
+                        0L,
+                        androidx.media3.common.C.msToUs(effectiveDurMs),
+                        windowIndex,
+                        windowIndex,
+                        0L
+                    )
+                    return window
+                }
+
+                override fun getPeriodCount(): Int = chapters.size
+
+                override fun getPeriod(periodIndex: Int, period: Period, setIds: Boolean): Period {
+                    val chapter = chapters[periodIndex]
+                    val nextStart = if (periodIndex + 1 < chapters.size) chapters[periodIndex + 1].startMs else totalMs
+                    val durMs = if (byChapter) (nextStart - chapter.startMs).coerceAtLeast(0L) else totalMs
+                    val effectiveDurMs = if (scaled) scaleAudioTimeMs(durMs, speed, true) else durMs
+                    val chapId = if (setIds) "chap_$periodIndex" else null
+                    
+                    period.set(
+                        chapId,
+                        chapId,
+                        periodIndex,
+                        androidx.media3.common.C.msToUs(effectiveDurMs),
+                        0L
+                    )
+                    return period
+                }
+
+                override fun getIndexOfPeriod(uid: Any): Int {
+                    if (uid is String && uid.startsWith("chap_")) {
+                        val num = uid.replace("chap_", "")
+                        return if (num.all { it.isDigit() }) num.toIntOrNull() ?: androidx.media3.common.C.INDEX_UNSET else androidx.media3.common.C.INDEX_UNSET
+                    }
+                    return androidx.media3.common.C.INDEX_UNSET
+                }
+
+                override fun getUidOfPeriod(periodIndex: Int): Any {
+                    return "chap_$periodIndex"
+                }
+            }
+        }
+        
         val baseTimeline = super.getCurrentTimeline()
         if (baseTimeline.isEmpty) return baseTimeline
-        val currentIdx = currentMediaItemIndex
-        val effectiveDurationMs = duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: return baseTimeline
-        val effectiveDurationUs = C.msToUs(effectiveDurationMs)
+        val currentIdx = super.getCurrentMediaItemIndex()
+        val rawDur = super.getDuration()
+        val effectiveDurationMs = if (rawDur != androidx.media3.common.C.TIME_UNSET && rawDur > 0L) {
+            if (isScaled()) scaleAudioTimeMs(rawDur, actualSpeed(), true) else rawDur
+        } else {
+            return baseTimeline
+        }
+        val effectiveDurationUs = androidx.media3.common.C.msToUs(effectiveDurationMs)
+        
         return object : Timeline() {
             override fun getWindowCount(): Int = baseTimeline.windowCount
 
@@ -2346,7 +2538,7 @@ internal class LagrangeLibrarySessionPlayer(
                     window.isSeekable = true
                     window.isDynamic = false
                     currentMediaItem?.let { window.mediaItem = it }
-                } else if (isScaled() && window.durationUs != C.TIME_UNSET && window.durationUs > 0L) {
+                } else if (isScaled() && window.durationUs != androidx.media3.common.C.TIME_UNSET && window.durationUs > 0L) {
                     window.durationUs = scaleAudioTimeMs(window.durationUs / 1_000L, actualSpeed(), true) * 1_000L
                     window.isSeekable = true
                 }
@@ -2363,7 +2555,7 @@ internal class LagrangeLibrarySessionPlayer(
                 baseTimeline.getPeriod(periodIndex, period, setIds)
                 if (period.windowIndex == currentIdx) {
                     period.durationUs = effectiveDurationUs
-                } else if (isScaled() && period.durationUs != C.TIME_UNSET && period.durationUs > 0L) {
+                } else if (isScaled() && period.durationUs != androidx.media3.common.C.TIME_UNSET && period.durationUs > 0L) {
                     period.durationUs = scaleAudioTimeMs(period.durationUs / 1_000L, actualSpeed(), true) * 1_000L
                 }
                 return period
@@ -2376,8 +2568,22 @@ internal class LagrangeLibrarySessionPlayer(
     }
 
     override fun seekTo(positionMs: Long) {
-        val unscaledTargetMs = unscaleAudioTimeMs(positionMs.coerceAtLeast(0L), actualSpeed(), isScaled())
         val active = sessionProvider?.invoke()
+        val chapters = active?.book?.audioChapters
+        val unscaledTargetMs = unscaleAudioTimeMs(positionMs.coerceAtLeast(0L), actualSpeed(), isScaled())
+        
+        if (!chapters.isNullOrEmpty()) {
+            val newAbsPos = if (isTimelineByChapterEnabled()) {
+                val idx = currentMediaItemIndex
+                if (idx in chapters.indices) chapters[idx].startMs + unscaledTargetMs else unscaledTargetMs
+            } else {
+                unscaledTargetMs
+            }
+            active.seekToAbsolutePosition(newAbsPos.coerceAtMost(active.totalDurationMs()))
+            notifyMetadataAndPositionChanged()
+            return
+        }
+
         if (active != null && active.audioFiles.size < 2) {
             val totalMs = active.totalDurationMs()
             val clampedTargetMs = if (totalMs > 0L) {
@@ -2394,6 +2600,15 @@ internal class LagrangeLibrarySessionPlayer(
     }
 
     override fun seekToDefaultPosition(mediaItemIndex: Int) {
+        val active = sessionProvider?.invoke()
+        val chapters = active?.book?.audioChapters
+        if (!chapters.isNullOrEmpty()) {
+            val idx = mediaItemIndex.coerceIn(chapters.indices)
+            active.seekToAbsolutePosition(chapters[idx].startMs)
+            notifyMetadataAndPositionChanged()
+            return
+        }
+        
         if (mediaItemIndex == currentMediaItemIndex) {
             seekTo(0L)
             return
@@ -2403,7 +2618,29 @@ internal class LagrangeLibrarySessionPlayer(
     }
 
     override fun seekTo(mediaItemIndex: Int, positionMs: Long) {
-        if (positionMs == C.TIME_UNSET) {
+        val active = sessionProvider?.invoke()
+        val chapters = active?.book?.audioChapters
+        if (!chapters.isNullOrEmpty()) {
+            if (positionMs == androidx.media3.common.C.TIME_UNSET) {
+                val idx = mediaItemIndex.coerceIn(chapters.indices)
+                active.seekToAbsolutePosition(chapters[idx].startMs)
+                notifyMetadataAndPositionChanged()
+            } else {
+                val idx = mediaItemIndex.coerceIn(chapters.indices)
+                val chap = chapters[idx]
+                val unscaledTargetMs = unscaleAudioTimeMs(positionMs.coerceAtLeast(0L), actualSpeed(), isScaled())
+                val newAbsPos = if (isTimelineByChapterEnabled()) {
+                    chap.startMs + unscaledTargetMs
+                } else {
+                    unscaledTargetMs
+                }
+                active.seekToAbsolutePosition(newAbsPos.coerceAtMost(active.totalDurationMs()))
+                notifyMetadataAndPositionChanged()
+            }
+            return
+        }
+
+        if (positionMs == androidx.media3.common.C.TIME_UNSET) {
             if (mediaItemIndex != currentMediaItemIndex && mediaItemIndex in 0 until mediaItemCount) {
                 super.seekTo(mediaItemIndex, 0L)
                 notifyMetadataAndPositionChanged()
@@ -2469,40 +2706,6 @@ internal class LagrangeLibrarySessionPlayer(
         if (playbackState == Player.STATE_IDLE) {
             super.prepare()
         }
-    }
-
-    override fun getMediaMetadata(): androidx.media3.common.MediaMetadata {
-        val base = super.getMediaMetadata()
-        val fallback = fallbackMetadataProvider?.invoke()
-        val builder = base.buildUpon()
-        val rawTitle = if (!base.title.isNullOrBlank()) {
-            base.title.toString()
-        } else {
-            fallback?.title?.toString()
-        }
-        if (!rawTitle.isNullOrBlank()) {
-            builder.setTitle(rawTitle.sanitizeAudiobookTitle())
-        }
-        val rawAuthor = base.artist?.toString()?.takeIf { it.isNotBlank() }
-            ?: fallback?.artist?.toString()?.takeIf { it.isNotBlank() }
-        val effectiveArtist = resolveSubtitleOrArtist(rawAuthor)
-        if (!effectiveArtist.isNullOrBlank()) {
-            builder.setArtist(effectiveArtist)
-            if (shouldFormatAndroidAutoEtaSubtitle()) {
-                builder.setSubtitle(effectiveArtist)
-            }
-        }
-        if (base.artworkUri == null && fallback?.artworkUri != null) {
-            builder.setArtworkUri(fallback.artworkUri)
-        }
-        if (base.artworkData == null && fallback?.artworkData != null) {
-            builder.setArtworkData(fallback.artworkData, fallback.artworkDataType)
-        }
-        val currentDuration = duration
-        if (currentDuration != C.TIME_UNSET && currentDuration > 0L) {
-            builder.setDurationMs(currentDuration)
-        }
-        return builder.build()
     }
 
     override fun getAvailableCommands(): Player.Commands =

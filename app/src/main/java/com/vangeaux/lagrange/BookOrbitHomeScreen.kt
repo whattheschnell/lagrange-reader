@@ -4383,6 +4383,19 @@ if (selectedCategory == OptionsCategory.PLAYBACK && subDestination == null) item
                     onPreferencesChange(preferences.copy(scaleProgressByPlaybackSpeed = it))
                 }
             )
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.auto_settings_timeline_by_chapter_title)) },
+                supportingContent = { Text(stringResource(R.string.auto_settings_timeline_by_chapter_summary)) },
+                trailingContent = {
+                    Switch(
+                        checked = preferences.androidAutoTimelineByChapter,
+                        modifier = Modifier.testTag("options-aa-timeline-by-chapter"),
+                        onCheckedChange = {
+                            onPreferencesChange(preferences.copy(androidAutoTimelineByChapter = it))
+                        }
+                    )
+                }
+            )
         }
         if (selectedCategory == OptionsCategory.PLAYBACK && subDestination == null) item(key = "android-auto-menu-item") {
             Column(

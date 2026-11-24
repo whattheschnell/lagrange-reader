@@ -45,4 +45,6 @@
     <string name="auto_settings_steering_summary">设置车辆跳过按钮是跳章节还是按时间跳过。</string>
     <string name="auto_settings_vehicle_skip_title">车辆跳过按钮跳转章节</string>
     <string name="auto_settings_vehicle_skip_summary">启用后，方向盘上一首/下一首将跳章节，而不是跳转 10 秒/30 秒。</string>
+    <string name="auto_settings_timeline_by_chapter_title">仅章节进度条</string>
+    <string name="auto_settings_timeline_by_chapter_summary">在车载显示屏上显示当前章节的时间轴，而不是整本书的时间轴。</string>
 </resources>
